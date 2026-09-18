@@ -3,7 +3,7 @@ using YAXArrayBase, Test
   @test_throws "No backend found." YAXArrayBase.backendfrompath("test.zarr")
 end
 
-using NetCDF, Zarr, NCDatasets
+using NetCDF, Zarr, NCDatasets, DiskArrays
 
 using Pkg.Artifacts
 import Downloads
@@ -77,7 +77,41 @@ end
   @test !YAXArrayBase.iscompressed(h)
   @test all(isapprox.(h[1:2,1:2], [215.893 217.168; 215.805 217.03]))
   @test allow_parallel_write(ds_nc) == false
-  @test allow_missings(ds_nc) == true
+  @test allow_missings(ds_nc) == false
+  # handles carry the file's chunking
+  @test DiskArrays.eachchunk(h) == DiskArrays.eachchunk(get_var_handle(YAXArrayBase.to_dataset(p2), "tas"))
+  # a failed open reports the real error, not close(nothing)
+  @test_throws NCDatasets.NetCDFError YAXArrayBase.open_dataset_handle(identity,
+    YAXArrayBase.to_dataset(tempname() * ".nc", driver=:ncdatasets))
+end
+
+@testset "NCDatasets hands over raw storage values" begin
+  # scale_factor/add_offset/_FillValue are applied by YAXArrays, not the backend
+  p = tempname() * ".nc"
+  NCDataset(p, "c") do nc
+    defDim(nc, "x", 4)
+    v = defVar(nc, "v", Int16, ("x",); fillvalue=Int16(-1),
+               attrib=["scale_factor"=>0.5, "add_offset"=>100.0])
+    v.var[:] = Int16[2, 4, -1, 8]
+    t = defVar(nc, "time", Float64, ("x",); attrib=["units"=>"days since 2000-01-01"])
+    t.var[:] = [0.0, 1.0, 2.0, 3.0]
+    c = defVar(nc, "c", Float32, ("x",); chunksizes=(2,), deflatelevel=1)
+    c[:] = 1:4
+  end
+  ds = YAXArrayBase.to_dataset(p, driver=:ncdatasets)
+  h = get_var_handle(ds, "v")
+  @test eltype(h) == Int16
+  @test h[:] == Int16[2, 4, -1, 8]
+  a = get_var_attrs(ds, "v")
+  @test a["scale_factor"] == 0.5 && a["add_offset"] == 100.0
+  @test a["_FillValue"] == Int16(-1) && a["missing_value"] == Int16(-1)
+  @test eltype(get_var_handle(ds, "time")) == Float64
+  @test get_var_handle(ds, "time")[:] == [0.0, 1.0, 2.0, 3.0]
+  c = get_var_handle(ds, "c")
+  @test DiskArrays.eachchunk(c) == DiskArrays.GridChunks(c, (2,))
+  @test YAXArrayBase.iscompressed(c)
+  @test !YAXArrayBase.iscompressed(h)
+  rm(p)
 end
 
 @testset "Reading Zarr" begin
